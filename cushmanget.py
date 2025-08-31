@@ -9,6 +9,8 @@ import re
 import json
 import csv
 import asyncio
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import aiohttp
@@ -28,56 +30,131 @@ class CushmanScraper:
         self.max_concurrent = max_concurrent
         self.delay = delay
         self.cache_dir = Path(cache_dir)
-        self.session = None
+        self.cache = None
+        self.cached_session = None
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.ua = UserAgent()
         
     async def __aenter__(self):
         # Setup filesystem-based HTTP cache
         self.cache_dir.mkdir(exist_ok=True)
-        cache = FileBackend(
+        self.cache = FileBackend(
             cache_name=str(self.cache_dir / 'http_cache'),
             expire_after=3600  # Cache for 1 hour
         )
         
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=self.max_concurrent)
+        # Create a persistent session for cached requests
         timeout = aiohttp.ClientTimeout(total=60)
-        
-        self.session = CachedSession(
-            cache=cache,
-            connector=connector,
+        self.cached_session = CachedSession(
+            cache=self.cache,
             timeout=timeout,
-            trust_env=True,  # Respect proxy environment variables
+            trust_env=True
         )
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+        if self.cached_session:
+            await self.cached_session.close()
+        if self.cache:
+            await self.cache.close()
     
-    async def load_progress(self, progress_file: Path) -> Dict:
-        """Load progress from file"""
-        if progress_file.exists():
-            async with aiofiles.open(progress_file, 'r') as f:
-                content = await f.read()
-                return json.loads(content)
-        return {
+    async def scan_existing_progress(self, pages_dir: Path, items_dir: Path, images_dir: Path = None) -> Dict:
+        """Scan existing metadata files to determine progress"""
+        progress = {
             'discovered_items': [],
             'processed_metadata': set(),
             'downloaded_images': set(),
             'failed_items': set(),
+            'metadata_results': [],
             'last_page': 0
         }
-    
-    async def save_progress(self, progress_file: Path, progress: Dict):
-        """Save progress to file"""
-        progress_copy = progress.copy()
-        for key in ['processed_metadata', 'downloaded_images', 'failed_items']:
-            if isinstance(progress_copy[key], set):
-                progress_copy[key] = list(progress_copy[key])
         
-        async with aiofiles.open(progress_file, 'w') as f:
-            await f.write(json.dumps(progress_copy, indent=2))
+        # Use a set to track unique item IDs and avoid duplicates
+        unique_items = {}
+        
+        # Scan existing page files
+        if pages_dir.exists():
+            page_files = list(pages_dir.glob("*.json"))
+            for page_file in page_files:
+                try:
+                    # Extract page number from filename (e.g., "0001.json" -> 1)
+                    page_num = int(page_file.stem)
+                    progress['last_page'] = max(progress['last_page'], page_num)
+                    
+                    # Load page metadata to get discovered items
+                    async with aiofiles.open(page_file, 'r') as f:
+                        page_data = json.loads(await f.read())
+                        if 'items' in page_data:
+                            for item in page_data['items']:
+                                # Only add if we haven't seen this item ID before
+                                if item['id'] not in unique_items:
+                                    unique_items[item['id']] = item
+                except (ValueError, json.JSONDecodeError):
+                    continue
+        
+        # Convert unique items dict back to list
+        progress['discovered_items'] = list(unique_items.values())
+        
+        # Scan existing item metadata files
+        if items_dir.exists():
+            item_files = list(items_dir.glob("*.json"))
+            for item_file in item_files:
+                try:
+                    item_id = item_file.stem
+                    progress['processed_metadata'].add(item_id)
+                    
+                    # Load item metadata for final results
+                    async with aiofiles.open(item_file, 'r') as f:
+                        item_data = json.loads(await f.read())
+                        progress['metadata_results'].append(item_data)
+                except json.JSONDecodeError:
+                    continue
+        
+        # Scan existing image files
+        if images_dir and images_dir.exists():
+            image_files = list(images_dir.glob("*.jp2"))
+            for image_file in image_files:
+                # Extract item ID from JP2 filename (e.g., "P15818.jp2" -> find matching item)
+                filename = image_file.name
+                # Find corresponding item by checking metadata for this filename
+                for item_data in progress['metadata_results']:
+                    if item_data.get('jp2_filename') == filename:
+                        progress['downloaded_images'].add(item_data['id'])
+                        break
+        
+        return progress
+    
+    async def get_max_page_number(self) -> int:
+        """Get the maximum page number from the last li element in pagination"""
+        try:
+            headers = {'User-Agent': self.ua.random}
+            async with self.cached_session.get(f"{self.collection_url}?page=1", headers=headers) as response:
+                response.raise_for_status()
+                content = await response.text()
+            
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Find pagination ul element
+            pagination_ul = soup.find('ul', class_='pagination')
+            if pagination_ul:
+                # Get all li elements in the pagination
+                li_elements = pagination_ul.find_all('li')
+                
+                # Start from the last li element and work backwards to find the highest page number
+                for li in reversed(li_elements):
+                    # Look for an 'a' tag with href containing page= parameter
+                    link = li.find('a', href=re.compile(r'page=\d+'))
+                    if link:
+                        href = link.get('href', '')
+                        match = re.search(r'page=(\d+)', href)
+                        if match:
+                            return int(match.group(1))
+            
+            return None
+            
+        except Exception as e:
+            print(f"Could not determine max page number: {e}")
+            return None
     
     async def get_page_items(self, page: int, pages_dir: Path) -> List[Dict]:
         """Get items from a specific page with caching and save page metadata"""
@@ -86,12 +163,14 @@ class CushmanScraper:
             
             try:
                 headers = {'User-Agent': self.ua.random}
-                async with self.session.get(page_url, headers=headers) as response:
+                
+                # Use the persistent cached session
+                async with self.cached_session.get(page_url, headers=headers) as response:
                     response.raise_for_status()
                     content = await response.text()
-                    
-                    # Check if response was cached (silent for cleaner progress bars)
-                    
+                
+                # Check if response was cached (silent for cleaner progress bars)
+                
                 soup = BeautifulSoup(content, 'html.parser')
                 item_links = soup.find_all('a', href=re.compile(r'/concern/images/[a-z0-9]+'))
                 
@@ -111,7 +190,7 @@ class CushmanScraper:
                     'url': page_url,
                     'item_count': len(items),
                     'items': items,
-                    'scraped_at': asyncio.get_event_loop().time()
+                    'scraped_at': datetime.now(timezone.utc).isoformat()
                 }
                 
                 page_file = pages_dir / f"{page:04d}.json"
@@ -140,16 +219,33 @@ class CushmanScraper:
             print("Could not fetch any items from page 1")
             return []
         
+        # Get actual max page number from HTML
+        if not max_pages:
+            max_pages = await self.get_max_page_number()
+            if max_pages:
+                print(f"Detected {max_pages} pages in collection")
+            else:
+                print("Could not determine total pages, will discover until empty pages found")
+        
         # Create page discovery queue
         page_queue = asyncio.Queue()
         start_page = page
-        end_page = max_pages if max_pages else 1500  # Estimate based on collection size
         
-        for p in range(start_page, end_page + 1):
-            await page_queue.put(p)
-        
-        # Create progress bar for page discovery
-        discovery_pbar = tqdm(total=end_page - start_page + 1, desc="Discovering pages", unit="pages")
+        if max_pages:
+            end_page = max_pages
+            for p in range(start_page, end_page + 1):
+                await page_queue.put(p)
+            
+            # Create progress bar with known total
+            discovery_pbar = tqdm(total=end_page - start_page + 1, desc="Discovering pages", unit="pages")
+        else:
+            # Unknown total pages - add a reasonable batch to start
+            end_page = start_page + 100  # Start with 100 pages, will expand if needed
+            for p in range(start_page, end_page + 1):
+                await page_queue.put(p)
+            
+            # Create progress bar without known total
+            discovery_pbar = tqdm(desc="Discovering pages", unit="pages")
         
         async def page_worker():
             items = []
@@ -167,7 +263,7 @@ class CushmanScraper:
                         consecutive_empty = 0
                         items.extend(page_items)
                         progress['last_page'] = page_num
-                        discovery_pbar.set_description(f"Discovering pages (found: {len(page_items)} items)")
+                        discovery_pbar.set_description("Discovering pages")
                     
                     discovery_pbar.update(1)
                     page_queue.task_done()
@@ -181,7 +277,7 @@ class CushmanScraper:
             return items
         
         # Start page discovery workers
-        workers = [asyncio.create_task(page_worker()) for _ in range(min(3, self.max_concurrent))]
+        workers = [asyncio.create_task(page_worker()) for _ in range(min(self.max_concurrent, 20))]
         worker_results = await asyncio.gather(*workers, return_exceptions=True)
         
         discovery_pbar.close()
@@ -195,16 +291,38 @@ class CushmanScraper:
                         seen.add(item['id'])
                         all_items.append(item)
         
-        progress['discovered_items'] = all_items
-        print(f"Discovered {len(all_items)} unique items")
-        return all_items
+        # Remove duplicates from discovered items
+        seen = set()
+        unique_items = []
+        for item in all_items:
+            if item['id'] not in seen:
+                seen.add(item['id'])
+                unique_items.append(item)
+        
+        progress['discovered_items'] = unique_items
+        print(f"Discovered {len(unique_items)} unique items")
+        return unique_items
     
     async def extract_metadata(self, item: Dict, items_dir: Path) -> Optional[Dict]:
         """Extract metadata from an individual item page with caching and save individual item metadata"""
         async with self.semaphore:
+            # Check if JSON file already exists
+            item_file = items_dir / f"{item['id']}.json"
+            if item_file.exists():
+                # Load existing metadata and return it
+                try:
+                    async with aiofiles.open(item_file, 'r') as f:
+                        existing_metadata = json.loads(await f.read())
+                        return existing_metadata
+                except (json.JSONDecodeError, OSError):
+                    # If file is corrupted, continue with re-scraping
+                    pass
+            
             try:
                 headers = {'User-Agent': self.ua.random}
-                async with self.session.get(item['url'], headers=headers) as response:
+                
+                # Use the persistent cached session
+                async with self.cached_session.get(item['url'], headers=headers) as response:
                     response.raise_for_status()
                     content = await response.text()
                 
@@ -213,7 +331,7 @@ class CushmanScraper:
                 metadata = {
                     'url': item['url'],
                     'id': item['id'],
-                    'scraped_at': asyncio.get_event_loop().time()
+                    'scraped_at': datetime.now(timezone.utc).isoformat()
                 }
                 
                 # Extract title
@@ -238,11 +356,27 @@ class CushmanScraper:
                             'description': 'description',
                             'collection': 'collection',
                             'holding location': 'holding_location',
-                            'persistent url': 'persistent_url'
+                            'persistent url': 'persistent_url',
+                            'state/province': 'state',
+                            'cushman identifier': 'cushman_identifier',
                         }
                         
                         mapped_key = field_mappings.get(key, key.replace(' ', '_'))
-                        metadata[mapped_key] = value
+                        
+                        # Special handling for subjects - parse as list from ul/li elements
+                        if mapped_key == 'subjects':
+                            # Look for ul element within the dd element
+                            ul_element = dd.find('ul')
+                            if ul_element:
+                                # Extract text from each li element
+                                subjects = [li.get_text().strip() for li in ul_element.find_all('li') if li.get_text().strip()]
+                            else:
+                                # Fallback to plain text if no ul found
+                                subjects = [value.strip()] if value.strip() else []
+                            
+                            metadata[mapped_key] = subjects
+                        else:
+                            metadata[mapped_key] = value
                 
                 # Extract JP2 download link
                 jp2_link = soup.find('a', href=re.compile(r'.*\.jp2$'))
@@ -256,11 +390,15 @@ class CushmanScraper:
                     if purl_link:
                         metadata['persistent_url'] = purl_link['href']
                 
-                # Save individual item metadata
-                item_file = items_dir / f"{item['id']}.json"
-                async with aiofiles.open(item_file, 'w') as f:
-                    await f.write(json.dumps(metadata, indent=2))
+                # Use cushman_identifier for filename if available, otherwise fall back to item ID
+                filename = metadata.get('cushman_identifier')
+                item_file = items_dir / f"{filename}.json"
                 
+                # Save individual item metadata
+                if metadata.get('cushman_identifier'):
+                    async with aiofiles.open(item_file, 'w') as f:
+                        await f.write(json.dumps(metadata, indent=2))
+
                 await asyncio.sleep(self.delay)
                 return metadata
                 
@@ -276,12 +414,11 @@ class CushmanScraper:
                     return True
                 
                 # Create a new session for image downloads (no caching for large files)
-                connector = aiohttp.TCPConnector(limit=100)
                 timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout for large images
+                headers = {'User-Agent': self.ua.random}
                 
                 # Use regular ClientSession (not CachedSession) to avoid caching large image files
-                async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True) as download_session:
-                    headers = {'User-Agent': self.ua.random}
+                async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as download_session:
                     async with download_session.get(jp2_url, headers=headers) as response:
                         response.raise_for_status()
                         
@@ -313,11 +450,6 @@ class CushmanScraper:
         while True:
             try:
                 item = await asyncio.wait_for(metadata_queue.get(), timeout=1.0)
-                
-                if item['id'] in progress['processed_metadata']:
-                    metadata_queue.task_done()
-                    pbar.update(1)
-                    continue
                 
                 metadata = await self.extract_metadata(item, items_dir)
                 if metadata:
@@ -379,24 +511,15 @@ class CushmanScraper:
         items_dir = metadata_dir / "items"
         items_dir.mkdir(exist_ok=True)
         
-        progress_file = output_path / "progress.json"
-        progress = await self.load_progress(progress_file)
-        
-        # Convert lists back to sets for processing
-        for key in ['processed_metadata', 'downloaded_images', 'failed_items']:
-            if isinstance(progress[key], list):
-                progress[key] = set(progress[key])
-        
-        if 'metadata_results' not in progress:
-            progress['metadata_results'] = []
-        
         if download_images:
             images_path = output_path / "images"
             images_path.mkdir(exist_ok=True)
         
+        # Scan existing files to determine progress instead of using progress.json
+        progress = await self.scan_existing_progress(pages_dir, items_dir, images_path if download_images else None)
+        
         # Discover all items
         items = await self.discover_all_items(progress, pages_dir, max_pages)
-        await self.save_progress(progress_file, progress)
         
         if max_items:
             items = items[:max_items]
@@ -428,9 +551,6 @@ class CushmanScraper:
                 worker.cancel()
             
             metadata_pbar.close()
-            
-            # Save progress after metadata extraction
-            await self.save_progress(progress_file, progress)
         else:
             print("All metadata already extracted")
         
@@ -463,9 +583,6 @@ class CushmanScraper:
         
         # Save final metadata files
         await self.save_final_metadata(output_path, progress['metadata_results'])
-        
-        # Final progress save
-        await self.save_progress(progress_file, progress)
         
         print(f"\nScraping complete!")
         print(f"Processed {len(progress['processed_metadata'])} items")
