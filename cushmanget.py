@@ -100,6 +100,7 @@ class CushmanScraper:
             item_files = list(items_dir.glob("*.json"))
             for item_file in item_files:
                 try:
+                    # Use item ID from filename as the primary key
                     item_id = item_file.stem
                     progress['processed_metadata'].add(item_id)
                     
@@ -112,15 +113,13 @@ class CushmanScraper:
         
         # Scan existing image files
         if images_dir and images_dir.exists():
-            image_files = list(images_dir.glob("*.jp2"))
+            image_files = list(images_dir.glob("*.*"))  # Accept any image file extension
+            
+            # Extract item IDs from image filenames (remove extension)
             for image_file in image_files:
-                # Extract item ID from JP2 filename (e.g., "P15818.jp2" -> find matching item)
-                filename = image_file.name
-                # Find corresponding item by checking metadata for this filename
-                for item_data in progress['metadata_results']:
-                    if item_data.get('jp2_filename') == filename:
-                        progress['downloaded_images'].add(item_data['id'])
-                        break
+                # Get the stem (filename without extension) which should be the item_id
+                item_id = image_file.stem
+                progress['downloaded_images'].add(item_id)
         
         return progress
     
@@ -150,11 +149,10 @@ class CushmanScraper:
                         if match:
                             return int(match.group(1))
             
-            return None
+            raise ValueError("Could not find pagination with valid page numbers")
             
         except Exception as e:
-            print(f"Could not determine max page number: {e}")
-            return None
+            raise ValueError(f"Could not determine max page number: {e}")
     
     async def get_page_items(self, page: int, pages_dir: Path) -> List[Dict]:
         """Get items from a specific page with caching and save page metadata"""
@@ -206,46 +204,99 @@ class CushmanScraper:
     
     async def discover_all_items(self, progress: Dict, pages_dir: Path, max_pages: Optional[int] = None) -> List[Dict]:
         """Discover all items in the collection with resume support"""
-        if progress['discovered_items']:
-            print(f"Resuming from {len(progress['discovered_items'])} discovered items")
-            return progress['discovered_items']
         
-        all_items = []
-        page = max(1, progress['last_page'])
-        
-        # Sample first page to check for items
-        sample_items = await self.get_page_items(1, pages_dir)
-        if not sample_items:
-            print("Could not fetch any items from page 1")
-            return []
-        
-        # Get actual max page number from HTML
+        # Get actual max page number from HTML (mandatory)
         if not max_pages:
             max_pages = await self.get_max_page_number()
-            if max_pages:
-                print(f"Detected {max_pages} pages in collection")
+            print(f"Detected {max_pages} pages in collection")
+        
+        # Determine which pages already exist by scanning the pages folder
+        existing_pages = set()
+        if pages_dir.exists():
+            for page_file in pages_dir.glob("*.json"):
+                try:
+                    page_num = int(page_file.stem)
+                    existing_pages.add(page_num)
+                except ValueError:
+                    continue
+        
+        # Check if we have complete page discovery
+        if len(existing_pages) == max_pages and all(p in existing_pages for p in range(1, max_pages + 1)):
+            if progress['discovered_items']:
+                print(f"Page discovery complete: found {len(progress['discovered_items'])} items from {max_pages} pages")
+                return progress['discovered_items']
             else:
-                print("Could not determine total pages, will discover until empty pages found")
+                print(f"All {max_pages} page files exist, loading items...")
+                # Load items from existing page files
+                unique_items = {}
+                page_files = list(pages_dir.glob("*.json"))
+                for page_file in page_files:
+                    try:
+                        async with aiofiles.open(page_file, 'r') as f:
+                            page_data = json.loads(await f.read())
+                            if 'items' in page_data:
+                                for item in page_data['items']:
+                                    unique_items[item['id']] = item
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                
+                items_list = list(unique_items.values())
+                progress['discovered_items'] = items_list
+                print(f"Loaded {len(items_list)} items from existing page files")
+                return items_list
         
-        # Create page discovery queue
+        all_items = []
+        
+        # Sample first page to check for items if we don't have it
+        if 1 not in existing_pages:
+            sample_items = await self.get_page_items(1, pages_dir)
+            if not sample_items:
+                print("Could not fetch any items from page 1")
+                return []
+        
+        # Create page discovery queue for missing pages
         page_queue = asyncio.Queue()
-        start_page = page
         
-        if max_pages:
-            end_page = max_pages
-            for p in range(start_page, end_page + 1):
+        # Add missing pages to queue
+        missing_pages = []
+        for p in range(1, max_pages + 1):
+            if p not in existing_pages:
+                missing_pages.append(p)
                 await page_queue.put(p)
-            
-            # Create progress bar with known total
-            discovery_pbar = tqdm(total=end_page - start_page + 1, desc="Discovering pages", unit="pages")
+        
+        if missing_pages:
+            print(f"Downloading {len(missing_pages)} missing pages (have {len(existing_pages)} pages)")
+            discovery_pbar = tqdm(total=len(missing_pages), desc="Downloading missing pages", unit="pages")
         else:
-            # Unknown total pages - add a reasonable batch to start
-            end_page = start_page + 100  # Start with 100 pages, will expand if needed
-            for p in range(start_page, end_page + 1):
-                await page_queue.put(p)
+            print(f"All {max_pages} pages already downloaded")
+            discovery_pbar = None
+        
+        # If no pages need downloading, just reload existing items and return
+        if page_queue.empty():
+            if discovery_pbar:
+                discovery_pbar.close()
             
-            # Create progress bar without known total
-            discovery_pbar = tqdm(desc="Discovering pages", unit="pages")
+            # Reload all items from existing pages
+            if progress['discovered_items']:
+                return progress['discovered_items']
+            
+            # Load items from all page files
+            unique_items = {}
+            if pages_dir.exists():
+                page_files = list(pages_dir.glob("*.json"))
+                for page_file in page_files:
+                    try:
+                        async with aiofiles.open(page_file, 'r') as f:
+                            page_data = json.loads(await f.read())
+                            if 'items' in page_data:
+                                for item in page_data['items']:
+                                    unique_items[item['id']] = item
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+            
+            items_list = list(unique_items.values())
+            progress['discovered_items'] = items_list
+            return items_list
         
         async def page_worker():
             items = []
@@ -258,20 +309,24 @@ class CushmanScraper:
                     
                     if not page_items:
                         consecutive_empty += 1
-                        discovery_pbar.set_description(f"Discovering pages (empty: {consecutive_empty})")
+                        if discovery_pbar:
+                            discovery_pbar.set_description(f"Downloading missing pages (empty: {consecutive_empty})")
                     else:
                         consecutive_empty = 0
                         items.extend(page_items)
                         progress['last_page'] = page_num
-                        discovery_pbar.set_description("Discovering pages")
+                        if discovery_pbar:
+                            discovery_pbar.set_description("Downloading missing pages")
                     
-                    discovery_pbar.update(1)
+                    if discovery_pbar:
+                        discovery_pbar.update(1)
                     page_queue.task_done()
                     
                 except asyncio.TimeoutError:
                     break
                 except Exception as e:
-                    discovery_pbar.set_description(f"Discovering pages (error: {str(e)[:20]})")
+                    if discovery_pbar:
+                        discovery_pbar.set_description(f"Downloading pages (error: {str(e)[:20]})")
                     consecutive_empty += 1
             
             return items
@@ -280,28 +335,33 @@ class CushmanScraper:
         workers = [asyncio.create_task(page_worker()) for _ in range(min(self.max_concurrent, 20))]
         worker_results = await asyncio.gather(*workers, return_exceptions=True)
         
-        discovery_pbar.close()
+        if discovery_pbar:
+            discovery_pbar.close()
         
-        # Collect and deduplicate results
-        seen = set()
+        # Collect results from workers
+        new_items = []
         for result in worker_results:
             if isinstance(result, list):
-                for item in result:
-                    if item['id'] not in seen:
-                        seen.add(item['id'])
-                        all_items.append(item)
+                new_items.extend(result)
         
-        # Remove duplicates from discovered items
-        seen = set()
-        unique_items = []
-        for item in all_items:
-            if item['id'] not in seen:
-                seen.add(item['id'])
-                unique_items.append(item)
+        # Now reload all items from all page files to get complete list
+        unique_items = {}
+        if pages_dir.exists():
+            page_files = list(pages_dir.glob("*.json"))
+            for page_file in page_files:
+                try:
+                    async with aiofiles.open(page_file, 'r') as f:
+                        page_data = json.loads(await f.read())
+                        if 'items' in page_data:
+                            for item in page_data['items']:
+                                unique_items[item['id']] = item
+                except (ValueError, json.JSONDecodeError):
+                    continue
         
-        progress['discovered_items'] = unique_items
-        print(f"Discovered {len(unique_items)} unique items")
-        return unique_items
+        items_list = list(unique_items.values())
+        progress['discovered_items'] = items_list
+        print(f"Page discovery complete: found {len(items_list)} total items")
+        return items_list
     
     async def extract_metadata(self, item: Dict, items_dir: Path) -> Optional[Dict]:
         """Extract metadata from an individual item page with caching and save individual item metadata"""
@@ -378,11 +438,20 @@ class CushmanScraper:
                         else:
                             metadata[mapped_key] = value
                 
-                # Extract JP2 download link
-                jp2_link = soup.find('a', href=re.compile(r'.*\.jp2$'))
-                if jp2_link:
-                    metadata['jp2_url'] = urljoin(self.base_url, jp2_link['href'])
-                    metadata['jp2_filename'] = jp2_link['href'].split('/')[-1]
+                # Extract download link from work-items table
+                work_items_div = soup.find('div', id='work-items')
+                if work_items_div:
+                    # Look for download link with class 'file_download'
+                    download_link = work_items_div.find('a', class_='file_download')
+                    if download_link and download_link.get('href'):
+                        metadata['download_link'] = urljoin(self.base_url, download_link['href'])
+                
+                # Fallback: Extract JP2 download link (legacy method)
+                if 'download_link' not in metadata:
+                    jp2_link = soup.find('a', href=re.compile(r'.*\.jp2$'))
+                    if jp2_link:
+                        metadata['jp2_url'] = urljoin(self.base_url, jp2_link['href'])
+                        metadata['jp2_filename'] = jp2_link['href'].split('/')[-1]
                 
                 # Extract persistent URL if not found
                 if 'persistent_url' not in metadata:
@@ -390,14 +459,12 @@ class CushmanScraper:
                     if purl_link:
                         metadata['persistent_url'] = purl_link['href']
                 
-                # Use cushman_identifier for filename if available, otherwise fall back to item ID
-                filename = metadata.get('cushman_identifier')
-                item_file = items_dir / f"{filename}.json"
+                # Always use item ID for filename to ensure consistent tracking
+                item_file = items_dir / f"{item['id']}.json"
                 
                 # Save individual item metadata
-                if metadata.get('cushman_identifier'):
-                    async with aiofiles.open(item_file, 'w') as f:
-                        await f.write(json.dumps(metadata, indent=2))
+                async with aiofiles.open(item_file, 'w') as f:
+                    await f.write(json.dumps(metadata, indent=2))
 
                 await asyncio.sleep(self.delay)
                 return metadata
@@ -406,21 +473,41 @@ class CushmanScraper:
                 # Silent error handling for cleaner progress bars
                 return None
     
-    async def download_image(self, jp2_url: str, output_path: Path) -> bool:
-        """Download JP2 image file"""
+    async def download_image(self, download_url: str, images_dir: Path, item_id: str) -> tuple[bool, Optional[str]]:
+        """Download image file, returning success status and filename from headers"""
         async with self.semaphore:
             try:
-                if output_path.exists():
-                    return True
-                
                 # Create a new session for image downloads (no caching for large files)
                 timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout for large images
                 headers = {'User-Agent': self.ua.random}
                 
                 # Use regular ClientSession (not CachedSession) to avoid caching large image files
                 async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as download_session:
-                    async with download_session.get(jp2_url, headers=headers) as response:
+                    async with download_session.get(download_url, headers=headers) as response:
                         response.raise_for_status()
+                        
+                        # Extract file extension from Content-Disposition header
+                        file_extension = None
+                        content_disposition = response.headers.get('Content-Disposition', '')
+                        if content_disposition:
+                            import re
+                            filename_match = re.search(r'filename[*]?=([^;]+)', content_disposition)
+                            if filename_match:
+                                original_filename = filename_match.group(1).strip('"\'')
+                                if '.' in original_filename:
+                                    file_extension = '.' + original_filename.split('.')[-1]
+                        
+                        # Raise exception if no file extension found
+                        if not file_extension:
+                            raise ValueError(f"No file extension found in Content-Disposition header for {download_url}")
+                        
+                        # Use item_id as filename with original extension
+                        filename = f"{item_id}{file_extension}"
+                        output_path = images_dir / filename
+                        
+                        # Check if file already exists
+                        if output_path.exists():
+                            return True, filename
                         
                         # Create temporary file first
                         temp_path = output_path.with_suffix('.tmp')
@@ -433,17 +520,15 @@ class CushmanScraper:
                         temp_path.rename(output_path)
                 
                 await asyncio.sleep(self.delay)
-                return True
+                return True, filename
                 
             except Exception as e:
                 # Silent error handling for cleaner progress bars
                 # Clean up partial download
-                if output_path.exists():
-                    output_path.unlink()
-                temp_path = output_path.with_suffix('.tmp')
+                temp_path = images_dir / f"temp_{hash(download_url) % 100000}.tmp"
                 if temp_path.exists():
                     temp_path.unlink()
-                return False
+                return False, None
     
     async def metadata_worker(self, metadata_queue: asyncio.Queue, progress: Dict, items_dir: Path, pbar: tqdm):
         """Worker for processing metadata extraction"""
@@ -454,6 +539,7 @@ class CushmanScraper:
                 metadata = await self.extract_metadata(item, items_dir)
                 if metadata:
                     progress['metadata_results'].append(metadata)
+                    # Use item ID as primary key for tracking
                     progress['processed_metadata'].add(item['id'])
                 else:
                     progress['failed_items'].add(item['id'])
@@ -473,16 +559,25 @@ class CushmanScraper:
             try:
                 metadata = await asyncio.wait_for(download_queue.get(), timeout=1.0)
                 
-                if 'jp2_filename' not in metadata or metadata['id'] in progress['downloaded_images']:
+                if metadata['id'] in progress['downloaded_images']:
                     download_queue.task_done()
                     pbar.update(1)
                     continue
                 
-                output_path = images_path / metadata['jp2_filename']
-                success = await self.download_image(metadata['jp2_url'], output_path)
+                # Use new download_link field or fallback to jp2_url
+                download_url = metadata.get('download_link') or metadata.get('jp2_url')
+                if not download_url:
+                    download_queue.task_done()
+                    pbar.update(1)
+                    continue
+                
+                success, filename = await self.download_image(download_url, images_path, metadata['id'])
                 
                 if success:
                     progress['downloaded_images'].add(metadata['id'])
+                    # Store the actual filename in metadata for future reference
+                    if filename:
+                        metadata['jp2_filename'] = filename
                 else:
                     progress['failed_items'].add(metadata['id'])
                 
@@ -495,6 +590,97 @@ class CushmanScraper:
                 # Silent error handling for cleaner progress bars
                 break
     
+    async def download_images_only(self, output_dir="./output"):
+        """Download images for existing metadata files only"""
+        output_path = Path(output_dir)
+        
+        # Check if metadata directory exists
+        metadata_dir = output_path / "metadata"
+        items_dir = metadata_dir / "items"
+        
+        if not items_dir.exists():
+            print(f"No metadata directory found at {items_dir}")
+            print("Run 'cushmanget metadata' first to scrape metadata")
+            return
+        
+        # Create images directory
+        images_path = output_path / "images"
+        images_path.mkdir(exist_ok=True)
+        
+        # Load existing metadata files
+        metadata_results = []
+        item_files = list(items_dir.glob("*.json"))
+        
+        if not item_files:
+            print("No metadata files found")
+            print("Run 'cushmanget metadata' first to scrape metadata")
+            return
+        
+        print(f"Loading metadata from {len(item_files)} files")
+        for item_file in item_files:
+            try:
+                async with aiofiles.open(item_file, 'r') as f:
+                    item_data = json.loads(await f.read())
+                    metadata_results.append(item_data)
+            except (json.JSONDecodeError, OSError):
+                continue
+        
+        if not metadata_results:
+            print("No valid metadata files found")
+            return
+        
+        # Filter for items with JP2 URLs that don't have downloaded images yet
+        download_queue = asyncio.Queue()
+        download_count = 0
+        downloaded_images = set()
+        
+        # Check which images are already downloaded
+        if images_path.exists():
+            image_files = list(images_path.glob("*.*"))  # Accept any image file extension
+            
+            # Extract item IDs from image filenames (remove extension)
+            for image_file in image_files:
+                # Get the stem (filename without extension) which should be the item_id
+                item_id = image_file.stem
+                downloaded_images.add(item_id)
+        
+        # Add items with download URLs to download queue (excluding already downloaded)
+        for metadata in metadata_results:
+            has_download = metadata.get('download_link') or metadata.get('jp2_url')
+            if has_download and metadata['id'] not in downloaded_images:
+                await download_queue.put(metadata)
+                download_count += 1
+        
+        if download_count == 0:
+            print("All available images already downloaded")
+            return
+        
+        print(f"Downloading {download_count} images")
+        
+        # Progress tracking
+        progress = {'downloaded_images': downloaded_images, 'failed_items': set()}
+        
+        # Start download workers
+        download_pbar = tqdm(total=download_count, desc="Downloading images")
+        download_workers = [
+            asyncio.create_task(self.download_worker(download_queue, progress, images_path, download_pbar))
+            for _ in range(self.max_concurrent)
+        ]
+        
+        # Wait for downloads
+        await download_queue.join()
+        
+        # Cancel download workers
+        for worker in download_workers:
+            worker.cancel()
+        
+        download_pbar.close()
+        
+        print(f"\nImage download complete!")
+        print(f"Downloaded {len(progress['downloaded_images']) - len(downloaded_images)} new images")
+        print(f"Failed downloads: {len(progress['failed_items'])}")
+        print(f"Cache directory: {self.cache_dir}")
+
     async def scrape_collection(self, output_dir="./output", download_images=True, 
                               max_pages=None, max_items=None):
         """Main async scraping function"""
@@ -524,6 +710,10 @@ class CushmanScraper:
         if max_items:
             items = items[:max_items]
         
+        # Show resume message only if there are processed metadata files
+        if progress['processed_metadata']:
+            print(f"Resuming: {len(progress['processed_metadata'])} items already processed")
+        
         print(f"Processing {len(items)} items")
         
         # Create queues
@@ -532,6 +722,7 @@ class CushmanScraper:
         
         # Add items to metadata queue (excluding already processed)
         for item in items:
+            # Check if this item has already been processed using item ID
             if item['id'] not in progress['processed_metadata']:
                 await metadata_queue.put(item)
         
@@ -556,10 +747,11 @@ class CushmanScraper:
         
         # Start image downloads if requested
         if download_images:
-            # Add metadata with JP2 URLs to download queue (excluding already downloaded)
+            # Add metadata with download URLs to download queue (excluding already downloaded)
             download_count = 0
             for metadata in progress['metadata_results']:
-                if 'jp2_url' in metadata and metadata['id'] not in progress['downloaded_images']:
+                has_download = metadata.get('download_link') or metadata.get('jp2_url')
+                if has_download and metadata['id'] not in progress['downloaded_images']:
                     await download_queue.put(metadata)
                     download_count += 1
             
@@ -616,42 +808,83 @@ class CushmanScraper:
             writer.writerows(metadata_results)
 
 
-@click.command()
+# Global options for all commands
+@click.group()
 @click.option('--output-dir', '-o', default='./output', help='Output directory for files')
 @click.option('--cache-dir', default='.cache', help='Cache directory for HTTP responses')
-@click.option('--no-images', is_flag=True, help='Skip image downloads, metadata only')
 @click.option('--max-pages', type=int, help='Maximum number of pages to scrape')
 @click.option('--max-items', type=int, help='Maximum number of items to process')
 @click.option('--transfers', type=int, default=10, help='Number of concurrent transfers')
 @click.option('--delay', type=float, default=0.1, help='Delay between requests in seconds')
-def main(output_dir, cache_dir, no_images, max_pages, max_items, transfers, delay):
+@click.pass_context
+def main(ctx, output_dir, cache_dir, max_pages, max_items, transfers, delay):
     """Charles W. Cushman Kodachrome Slides Collection Scraper
     
     Scrapes metadata and images from Indiana University's digital collection
     with parallel processing, caching, and resume capability.
+    """
+    # Store global options in context for subcommands
+    ctx.ensure_object(dict)
+    ctx.obj['output_dir'] = output_dir
+    ctx.obj['cache_dir'] = cache_dir
+    ctx.obj['max_pages'] = max_pages
+    ctx.obj['max_items'] = max_items
+    ctx.obj['transfers'] = transfers
+    ctx.obj['delay'] = delay
+
+
+@main.command()
+@click.pass_context
+def metadata(ctx):
+    """Scrape metadata only (no image downloads)
     
     Examples:
-      cushmanget                              # Scrape everything
-      cushmanget --no-images                  # Metadata only
-      cushmanget --max-items 100              # Limit to 100 items
-      cushmanget --transfers 20               # Increase parallelism
-      cushmanget --cache-dir ./custom_cache   # Custom cache location
+      cushmanget metadata                     # Scrape all metadata
+      cushmanget --max-items 100 metadata    # Limit to 100 items
+      cushmanget --transfers 20 metadata     # Increase parallelism
     """
     
     async def run_scraper():
         async with CushmanScraper(
-            max_concurrent=transfers, 
-            delay=delay, 
-            cache_dir=cache_dir
+            max_concurrent=ctx.obj['transfers'], 
+            delay=ctx.obj['delay'], 
+            cache_dir=ctx.obj['cache_dir']
         ) as scraper:
             await scraper.scrape_collection(
-                output_dir=output_dir,
-                download_images=not no_images,
-                max_pages=max_pages,
-                max_items=max_items
+                output_dir=ctx.obj['output_dir'],
+                download_images=False,
+                max_pages=ctx.obj['max_pages'],
+                max_items=ctx.obj['max_items']
             )
     
     asyncio.run(run_scraper())
+
+
+@main.command()
+@click.pass_context
+def images(ctx):
+    """Download images for existing metadata files
+    
+    This command only downloads images for items that already have 
+    metadata JSON files. Run 'metadata' command first.
+    
+    Examples:
+      cushmanget images                       # Download all available images
+      cushmanget --cache-dir ./cache images  # Custom cache location
+      cushmanget --transfers 20 images       # Increase parallelism
+    """
+    
+    async def run_downloader():
+        async with CushmanScraper(
+            max_concurrent=ctx.obj['transfers'], 
+            delay=ctx.obj['delay'], 
+            cache_dir=ctx.obj['cache_dir']
+        ) as scraper:
+            await scraper.download_images_only(
+                output_dir=ctx.obj['output_dir']
+            )
+    
+    asyncio.run(run_downloader())
 
 
 if __name__ == '__main__':

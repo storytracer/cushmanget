@@ -15,21 +15,26 @@ pip install -r requirements.txt
 
 ### Running the Scraper
 ```bash
-# Basic usage - scrape everything
-python cushmanget.py
-
 # Metadata only (no image downloads)
-python cushmanget.py --no-images
+python cushmanget.py metadata
+
+# Download images for existing metadata files
+python cushmanget.py images
 
 # Testing with limited items
-python cushmanget.py --max-items 100
+python cushmanget.py --max-items 100 metadata
 
-# Performance tuning
-python cushmanget.py --transfers 20 --delay 0.05
+# Performance tuning for metadata
+python cushmanget.py --transfers 20 --delay 0.05 metadata
+
+# Performance tuning for image downloads
+python cushmanget.py --transfers 20 images
 
 # Conservative settings
-python cushmanget.py --transfers 5 --delay 0.5
+python cushmanget.py --transfers 5 --delay 0.5 metadata
 ```
+
+**Note**: The `images` command only downloads images for items that already have metadata JSON files. Always run the `metadata` command first to scrape metadata, then use the `images` command to download the corresponding images.
 
 ## Architecture
 
