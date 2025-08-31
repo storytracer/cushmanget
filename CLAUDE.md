@@ -66,7 +66,7 @@ python cushmanget.py --transfers 5 --delay 0.5 metadata
 1. **Page Discovery**: Scrapes collection pages to discover all item URLs
 2. **Metadata Extraction**: Parallel workers extract metadata from item pages
 3. **Image Downloads**: Separate workers download JP2 images (if enabled)
-4. **Output Generation**: Saves metadata as both JSON and CSV formats
+4. **Output Generation**: Saves individual item metadata as JSON files
 
 ### Caching Strategy
 
@@ -78,12 +78,9 @@ python cushmanget.py --transfers 5 --delay 0.5 metadata
 
 ```
 output/
-├── metadata.json          # Complete metadata
-├── metadata.csv           # CSV format for analysis
-├── metadata/
-│   ├── pages/            # Individual page metadata
-│   └── items/            # Individual item metadata
-└── images/               # JP2 image files (if downloaded)
+├── pages/                # Individual page metadata
+├── items/                # Individual item metadata
+└── images/               # Image files (if downloaded)
 
 .cache/
 └── http_cache/           # HTTP response cache

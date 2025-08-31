@@ -473,7 +473,7 @@ class CushmanScraper:
                 # Silent error handling for cleaner progress bars
                 return None
     
-    async def download_image(self, download_url: str, images_dir: Path, item_id: str) -> tuple[bool, Optional[str]]:
+    async def download_image(self, download_url: str, images_dir: Path, item_id: str, desired_format: str = 'jp2') -> tuple[bool, Optional[str]]:
         """Download image file, returning success status and filename from headers"""
         async with self.semaphore:
             try:
@@ -501,6 +501,12 @@ class CushmanScraper:
                         if not file_extension:
                             raise ValueError(f"No file extension found in Content-Disposition header for {download_url}")
                         
+                        # Check if the file extension matches the desired format
+                        file_format = file_extension.lstrip('.').lower()
+                        if file_format != desired_format.lower():
+                            # Skip this file as it doesn't match the desired format
+                            return False, None
+                        
                         # Use item_id as filename with original extension
                         filename = f"{item_id}{file_extension}"
                         output_path = images_dir / filename
@@ -509,25 +515,16 @@ class CushmanScraper:
                         if output_path.exists():
                             return True, filename
                         
-                        # Create temporary file first
-                        temp_path = output_path.with_suffix('.tmp')
-                        
-                        async with aiofiles.open(temp_path, 'wb') as f:
+                        # Write file directly
+                        async with aiofiles.open(output_path, 'wb') as f:
                             async for chunk in response.content.iter_chunked(8192):
                                 await f.write(chunk)
-                        
-                        # Atomically move to final location
-                        temp_path.rename(output_path)
                 
                 await asyncio.sleep(self.delay)
                 return True, filename
                 
             except Exception as e:
                 # Silent error handling for cleaner progress bars
-                # Clean up partial download
-                temp_path = images_dir / f"temp_{hash(download_url) % 100000}.tmp"
-                if temp_path.exists():
-                    temp_path.unlink()
                 return False, None
     
     async def metadata_worker(self, metadata_queue: asyncio.Queue, progress: Dict, items_dir: Path, pbar: tqdm):
@@ -553,7 +550,7 @@ class CushmanScraper:
                 # Silent error handling for cleaner progress bars
                 break
     
-    async def download_worker(self, download_queue: asyncio.Queue, progress: Dict, images_path: Path, pbar: tqdm):
+    async def download_worker(self, download_queue: asyncio.Queue, progress: Dict, images_path: Path, pbar: tqdm, image_format: str = 'jp2'):
         """Worker for downloading images"""
         while True:
             try:
@@ -571,7 +568,7 @@ class CushmanScraper:
                     pbar.update(1)
                     continue
                 
-                success, filename = await self.download_image(download_url, images_path, metadata['id'])
+                success, filename = await self.download_image(download_url, images_path, metadata['id'], image_format)
                 
                 if success:
                     progress['downloaded_images'].add(metadata['id'])
@@ -590,16 +587,15 @@ class CushmanScraper:
                 # Silent error handling for cleaner progress bars
                 break
     
-    async def download_images_only(self, output_dir="./output"):
+    async def download_images_only(self, output_dir="./output", image_format="jp2"):
         """Download images for existing metadata files only"""
         output_path = Path(output_dir)
         
-        # Check if metadata directory exists
-        metadata_dir = output_path / "metadata"
-        items_dir = metadata_dir / "items"
+        # Check if items directory exists
+        items_dir = output_path / "items"
         
         if not items_dir.exists():
-            print(f"No metadata directory found at {items_dir}")
+            print(f"No items directory found at {items_dir}")
             print("Run 'cushmanget metadata' first to scrape metadata")
             return
         
@@ -663,7 +659,7 @@ class CushmanScraper:
         # Start download workers
         download_pbar = tqdm(total=download_count, desc="Downloading images")
         download_workers = [
-            asyncio.create_task(self.download_worker(download_queue, progress, images_path, download_pbar))
+            asyncio.create_task(self.download_worker(download_queue, progress, images_path, download_pbar, image_format))
             for _ in range(self.max_concurrent)
         ]
         
@@ -682,19 +678,16 @@ class CushmanScraper:
         print(f"Cache directory: {self.cache_dir}")
 
     async def scrape_collection(self, output_dir="./output", download_images=True, 
-                              max_pages=None, max_items=None):
+                              max_pages=None, max_items=None, image_format="jp2"):
         """Main async scraping function"""
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
         
-        # Create metadata directories
-        metadata_dir = output_path / "metadata"
-        metadata_dir.mkdir(exist_ok=True)
-        
-        pages_dir = metadata_dir / "pages"
+        # Create directories directly in output
+        pages_dir = output_path / "pages"
         pages_dir.mkdir(exist_ok=True)
         
-        items_dir = metadata_dir / "items"
+        items_dir = output_path / "items"
         items_dir.mkdir(exist_ok=True)
         
         if download_images:
@@ -758,7 +751,7 @@ class CushmanScraper:
             if download_count > 0:
                 download_pbar = tqdm(total=download_count, desc="Downloading images")
                 download_workers = [
-                    asyncio.create_task(self.download_worker(download_queue, progress, images_path, download_pbar))
+                    asyncio.create_task(self.download_worker(download_queue, progress, images_path, download_pbar, image_format))
                     for _ in range(self.max_concurrent)
                 ]
                 
@@ -773,39 +766,12 @@ class CushmanScraper:
             else:
                 print("All images already downloaded")
         
-        # Save final metadata files
-        await self.save_final_metadata(output_path, progress['metadata_results'])
-        
         print(f"\nScraping complete!")
         print(f"Processed {len(progress['processed_metadata'])} items")
         if download_images:
             print(f"Downloaded {len(progress['downloaded_images'])} images")
         print(f"Failed items: {len(progress['failed_items'])}")
         print(f"Cache directory: {self.cache_dir}")
-    
-    async def save_final_metadata(self, output_path: Path, metadata_results: List[Dict]):
-        """Save metadata to JSON and CSV files"""
-        if not metadata_results:
-            return
-        
-        # Save JSON
-        json_path = output_path / "metadata.json"
-        async with aiofiles.open(json_path, 'w', encoding='utf-8') as f:
-            await f.write(json.dumps(metadata_results, indent=2, ensure_ascii=False))
-        
-        # Save CSV
-        csv_path = output_path / "metadata.csv"
-        fieldnames = set()
-        for item in metadata_results:
-            fieldnames.update(item.keys())
-        fieldnames = sorted(list(fieldnames))
-        
-        # Write CSV synchronously (aiofiles doesn't support csv.writer)
-        import csv as sync_csv
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = sync_csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(metadata_results)
 
 
 # Global options for all commands
@@ -861,15 +827,17 @@ def metadata(ctx):
 
 
 @main.command()
+@click.option('--format', default='jp2', help='Image format to download (jp2, jpg, png, etc.)', show_default=True)
 @click.pass_context
-def images(ctx):
+def images(ctx, format):
     """Download images for existing metadata files
     
     This command only downloads images for items that already have 
     metadata JSON files. Run 'metadata' command first.
     
     Examples:
-      cushmanget images                       # Download all available images
+      cushmanget images                       # Download all jp2 images (default)
+      cushmanget images --format jpg         # Download jpg images only
       cushmanget --cache-dir ./cache images  # Custom cache location
       cushmanget --transfers 20 images       # Increase parallelism
     """
@@ -881,7 +849,8 @@ def images(ctx):
             cache_dir=ctx.obj['cache_dir']
         ) as scraper:
             await scraper.download_images_only(
-                output_dir=ctx.obj['output_dir']
+                output_dir=ctx.obj['output_dir'],
+                image_format=format
             )
     
     asyncio.run(run_downloader())
