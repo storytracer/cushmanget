@@ -859,7 +859,7 @@ def metadata(ctx):
 
 
 @main.command()
-@click.option('--format', help='Image format to download (jp2, jpg, png, etc.)', show_default=True)
+@click.option('--format', default='', help='Image format to download (jp2, jpg, png, etc.)', show_default=True)
 @click.pass_context
 def images(ctx, format):
     """Download images for existing metadata files
