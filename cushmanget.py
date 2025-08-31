@@ -170,7 +170,7 @@ class CushmanScraper:
                 # Check if response was cached (silent for cleaner progress bars)
                 
                 soup = BeautifulSoup(content, 'html.parser')
-                item_links = soup.find_all('a', href=re.compile(r'/concern/images/[a-z0-9]+'))
+                item_links = soup.select('p.media-heading > strong > a')
                 
                 items = []
                 for link in item_links:
@@ -438,20 +438,33 @@ class CushmanScraper:
                         else:
                             metadata[mapped_key] = value
                 
-                # Extract download link from work-items table
+                # Extract download links from work-items table
                 work_items_div = soup.find('div', id='work-items')
+                download_links = {}
                 if work_items_div:
-                    # Look for download link with class 'file_download'
-                    download_link = work_items_div.find('a', class_='file_download')
-                    if download_link and download_link.get('href'):
-                        metadata['download_link'] = urljoin(self.base_url, download_link['href'])
+                    # Find the table with related files
+                    table = work_items_div.find('table', class_='table')
+                    if table:
+                        # Process each row in the table body
+                        rows = table.find('tbody').find_all('tr') if table.find('tbody') else []
+                        for row in rows:
+                            # Extract filename from the title field (second column)
+                            title_cell = row.find('td', class_='attribute-filename')
+                            filename = None
+                            if title_cell:
+                                title_link = title_cell.find('a')
+                                if title_link:
+                                    filename = title_link.get_text().strip()
+                            
+                            # Extract download link from the actions column
+                            download_link = row.find('a', class_='file_download')
+                            if filename and download_link and download_link.get('href'):
+                                download_url = urljoin(self.base_url, download_link['href'])
+                                download_links[filename] = download_url
                 
-                # Fallback: Extract JP2 download link (legacy method)
-                if 'download_link' not in metadata:
-                    jp2_link = soup.find('a', href=re.compile(r'.*\.jp2$'))
-                    if jp2_link:
-                        metadata['jp2_url'] = urljoin(self.base_url, jp2_link['href'])
-                        metadata['jp2_filename'] = jp2_link['href'].split('/')[-1]
+                if download_links:
+                    metadata['download_links'] = download_links
+                
                 
                 # Extract persistent URL if not found
                 if 'persistent_url' not in metadata:
@@ -561,8 +574,16 @@ class CushmanScraper:
                     pbar.update(1)
                     continue
                 
-                # Use new download_link field or fallback to jp2_url
-                download_url = metadata.get('download_link') or metadata.get('jp2_url')
+                # Use download_links field, filter by desired format
+                download_links = metadata.get('download_links', {})
+                
+                # Pre-filter download links by file format
+                matching_urls = []
+                for filename, url in download_links.items():
+                    if filename.lower().endswith(f'.{image_format.lower()}'):
+                        matching_urls.append(url)
+                
+                download_url = matching_urls[0] if matching_urls else None
                 if not download_url:
                     download_queue.task_done()
                     pbar.update(1)
@@ -572,9 +593,6 @@ class CushmanScraper:
                 
                 if success:
                     progress['downloaded_images'].add(metadata['id'])
-                    # Store the actual filename in metadata for future reference
-                    if filename:
-                        metadata['jp2_filename'] = filename
                 else:
                     progress['failed_items'].add(metadata['id'])
                 
@@ -642,8 +660,15 @@ class CushmanScraper:
         
         # Add items with download URLs to download queue (excluding already downloaded)
         for metadata in metadata_results:
-            has_download = metadata.get('download_link') or metadata.get('jp2_url')
-            if has_download and metadata['id'] not in downloaded_images:
+            download_links = metadata.get('download_links', {})
+            
+            # Pre-filter download links by file format
+            has_matching_format = any(
+                filename.lower().endswith(f'.{image_format.lower()}') 
+                for filename in download_links.keys()
+            )
+            
+            if has_matching_format and metadata['id'] not in downloaded_images:
                 await download_queue.put(metadata)
                 download_count += 1
         
@@ -743,8 +768,15 @@ class CushmanScraper:
             # Add metadata with download URLs to download queue (excluding already downloaded)
             download_count = 0
             for metadata in progress['metadata_results']:
-                has_download = metadata.get('download_link') or metadata.get('jp2_url')
-                if has_download and metadata['id'] not in progress['downloaded_images']:
+                download_links = metadata.get('download_links', {})
+                
+                # Pre-filter download links by file format
+                has_matching_format = any(
+                    filename.lower().endswith(f'.{image_format.lower()}') 
+                    for filename in download_links.keys()
+                )
+                
+                if has_matching_format and metadata['id'] not in progress['downloaded_images']:
                     await download_queue.put(metadata)
                     download_count += 1
             
