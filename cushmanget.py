@@ -170,7 +170,7 @@ class CushmanScraper:
                 # Check if response was cached (silent for cleaner progress bars)
                 
                 soup = BeautifulSoup(content, 'html.parser')
-                item_links = soup.select('p.media-heading > strong > a')
+                item_links = soup.select('main > .hyc-container > .hyc-bl-results p.media-heading > strong > a')
                 
                 items = []
                 for link in item_links:
