@@ -486,7 +486,7 @@ class CushmanScraper:
                 # Silent error handling for cleaner progress bars
                 return None
     
-    async def download_image(self, download_url: str, images_dir: Path, item_id: str, desired_format: str = 'jp2') -> tuple[bool, Optional[str]]:
+    async def download_image(self, download_url: str, images_dir: Path, item_id: str, desired_format: str = '') -> tuple[bool, Optional[str]]:
         """Download image file, returning success status and filename from headers"""
         async with self.semaphore:
             try:
@@ -516,7 +516,7 @@ class CushmanScraper:
                         
                         # Check if the file extension matches the desired format
                         file_format = file_extension.lstrip('.').lower()
-                        if file_format != desired_format.lower():
+                        if desired_format and file_format != desired_format.lower():
                             # Skip this file as it doesn't match the desired format
                             return False, None
                         
@@ -563,7 +563,7 @@ class CushmanScraper:
                 # Silent error handling for cleaner progress bars
                 break
     
-    async def download_worker(self, download_queue: asyncio.Queue, progress: Dict, images_path: Path, pbar: tqdm, image_format: str = 'jp2'):
+    async def download_worker(self, download_queue: asyncio.Queue, progress: Dict, images_path: Path, pbar: tqdm, image_format: str = ''):
         """Worker for downloading images"""
         while True:
             try:
@@ -859,7 +859,7 @@ def metadata(ctx):
 
 
 @main.command()
-@click.option('--format', default='jp2', help='Image format to download (jp2, jpg, png, etc.)', show_default=True)
+@click.option('--format', help='Image format to download (jp2, jpg, png, etc.)', show_default=True)
 @click.pass_context
 def images(ctx, format):
     """Download images for existing metadata files
